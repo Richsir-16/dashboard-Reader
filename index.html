@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Reader Rollout — Executive Dashboard</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.24.7/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:wght@500;600&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#0B1220; --panel:#101B2E; --panel2:#0D1626; --border:#1E2A42;
+    --ink:#E7ECF5; --ink-dim:#8B98B3; --ink-faint:#5B6884;
+    --amber:#E0A94D; --teal:#4FD1C5; --rose:#E07A7A; --blue:#5B8DEF;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:'Inter',system-ui,sans-serif;-webkit-font-smoothing:antialiased}
+  h1,h2,.serif{font-family:'Fraunces',serif}
+  ::-webkit-scrollbar{height:8px;width:8px}
+  ::-webkit-scrollbar-thumb{background:var(--border);border-radius:8px}
+  table{border-collapse:collapse;width:100%}
+  th,td{text-align:left;padding:9px 12px;white-space:nowrap;font-size:13px}
+  thead th{position:sticky;top:0;background:var(--panel2);color:var(--ink-dim);font-weight:600;font-size:11px;letter-spacing:.02em;border-bottom:1px solid var(--border)}
+  tbody tr{border-bottom:1px solid var(--border)}
+  tbody tr:hover{background:#0F1B30}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:10px}
+  .chip{display:inline-block;padding:2px 9px;border-radius:99px;font-size:12px;font-weight:600}
+  .btn{cursor:pointer;border:1px solid var(--border);background:var(--panel2);color:var(--ink);border-radius:8px;padding:7px 12px;font-size:13px;font-weight:500}
+  .btn:hover{border-color:var(--ink-faint)}
+  .btn-primary{background:var(--amber);color:#1A1206;border-color:var(--amber);font-weight:600}
+  .kpi-click{cursor:pointer;transition:border-color .15s}
+  .kpi-click:hover{border-color:var(--amber)}
+  input,select{background:var(--panel2);border:1px solid var(--border);color:var(--ink);border-radius:8px;padding:8px 11px;font-size:13px}
+  input:focus,select:focus{outline:none;border-color:var(--teal)}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const {useState,useEffect,useMemo,useRef,useCallback} = React;
+
+/* ============================================================
+   CONFIG — edit these before deploying. See setup guide below.
+   ============================================================ */
+const SHEET_ID = "1auY3F72iBnw2geLmNRoxNxHmf2LCghbR9woIL32Sbfk";
+const GIDS = {
+  summary:   "0",              // TAB "Summary"
+  readerIn:  "1780063698",     // TAB "Plan implementation (reader In)"
+  readerOut: "1146960674",     // TAB "Plan implementation (reader Out)"
+  stock:     "1795516903"      // TAB "Reader Stock"
+};
+// gviz endpoint: works as long as the sheet is shared "Anyone with the link - Viewer".
+// No formal "Publish to web" needed.
+const csvUrl = gid => `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:csv&gid=${gid}`;
+const editUrl = gid => `https://docs.google.com/spreadsheets/d/${SHEET_ID}/edit#gid=${gid}`;
+const AUTO_REFRESH_MS = 5 * 60 * 1000;
+const LIVE_STATUSES = ["live"];
+const STOCK_BUFFER_MIN = 20; // alert when ready stock below this
+
+/* Flexible header matching: internal key -> list of possible raw header fragments (lowercased) */
+const ALIASES = {
+  summary: {
+    rcCode:["rc code","kode"], name:["nama lokasi","lokasi"], category:["building category","kategori"],
+    liveDate:["live date"], status:["status dki","status lokasi","status"], city:["city","kota"],
+    area:["area"], operator:["operator"], batch:["batch"], readerIn:["reader in","reader baru"],
+    readerOut:["reader out","reader lama"], tier:["tier"], migrasiStatus:["status migrasi"]
+  },
+  readerIn: {
+    rcCode:["rc code","kode"], name:["nama lokasi","lokasi"], readerType:["reader","tipe","type"],
+    targetDate:["target","tanggal live","live date"], status:["status"], batch:["batch"]
+  },
+  readerOut: {
+    rcCode:["rc code","kode"], name:["nama lokasi","lokasi"], readerType:["reader","tipe","type"],
+    targetDate:["target","tanggal live","live date"], status:["status"], batch:["batch"]
+  },
+  stock: {
+    readerType:["reader","tipe","type"], ready:["ready stock","ready"], allocated:["allocated","alokasi"],
+    inTransit:["in transit","transit"], defective:["defective","rusak"]
+  }
+};
+
+function norm(s){ return (s||"").toString().trim().toLowerCase(); }
+function findKey(headers, fragments){
+  for(const f of fragments){
+    const hit = headers.find(h => norm(h).includes(f));
+    if(hit) return hit;
+  }
+  return null;
+}
+function mapRows(rows, aliasMap){
+  if(!rows.length) return [];
+  const headers = Object.keys(rows[0]);
+  const resolved = {};
+  for(const key in aliasMap) resolved[key] = findKey(headers, aliasMap[key]);
+  return rows.map(r => {
+    const out = {_raw:r};
+    for(const key in resolved) out[key] = resolved[key] ? (r[resolved[key]]||"").toString().trim() : "";
+    return out;
+  }).filter(r => Object.keys(r).some(k => k!=="_raw" && r[k]));
+}
+
+async function fetchCsv(gid){
+  const res = await fetch(csvUrl(gid), {cache:"no-store"});
+  if(!res.ok) throw new Error("HTTP "+res.status);
+  const text = await res.text();
+  const parsed = Papa.parse(text, {header:true, skipEmptyLines:true});
+  return parsed.data;
+}
+
+/* ---------- small UI atoms ---------- */
+function Chip({children,tone="slate"}){
+  const map = {
+    live:{bg:"#173229",fg:"#6ADE9A"}, scheduled:{bg:"#26314E",fg:"#7FA8FF"},
+    rescheduled:{bg:"#3A2A17",fg:"#E0A94D"}, pending:{bg:"#3A1E1E",fg:"#E07A7A"},
+    pullout:{bg:"#2A2A2A",fg:"#9AA3B5"}, canceled:{bg:"#2A2A2A",fg:"#9AA3B5"},
+    slate:{bg:"#1E2A42",fg:"#8B98B3"}
+  };
+  const key = norm(children).replace(/\s/g,"");
+  const c = map[key] || map.slate;
+  return <span className="chip" style={{background:c.bg,color:c.fg}}>{children||"—"}</span>;
+}
+function KpiCard({label,value,sub,onClick}){
+  return (
+    <div className={"card p-5 "+(onClick?"kpi-click":"")} onClick={onClick}>
+      <div className="text-xs uppercase tracking-wide" style={{color:"var(--ink-faint)"}}>{label}</div>
+      <div className="serif text-3xl mt-2" style={{color:"var(--ink)"}}>{value}</div>
+      {sub && <div className="text-xs mt-1" style={{color:"var(--ink-dim)"}}>{sub}</div>}
+    </div>
+  );
+}
+function Canvas({build, deps}){
+  const ref = useRef(null); const chartRef = useRef(null);
+  useEffect(()=>{
+    if(!ref.current) return;
+    if(chartRef.current) chartRef.current.destroy();
+    chartRef.current = build(ref.current.getContext("2d"));
+    return ()=> chartRef.current && chartRef.current.destroy();
+  }, deps);
+  return <canvas ref={ref}></canvas>;
+}
+const CHART_FONT = { color:"#8B98B3", font:{family:"Inter"} };
+
+/* ---------- data hook ---------- */
+function useSheetData(){
+  const [state,setState] = useState({loading:true, error:null, data:null, updatedAt:null});
+  const load = useCallback(async ()=>{
+    setState(s=>({...s, loading:true, error:null}));
+    try{
+      const [sRaw,inRaw,outRaw,stRaw] = await Promise.all([
+        fetchCsv(GIDS.summary), fetchCsv(GIDS.readerIn), fetchCsv(GIDS.readerOut), fetchCsv(GIDS.stock)
+      ]);
+      const summary = mapRows(sRaw, ALIASES.summary);
+      const readerIn = mapRows(inRaw, ALIASES.readerIn);
+      const readerOut = mapRows(outRaw, ALIASES.readerOut);
+      const stock = mapRows(stRaw, ALIASES.stock);
+
+      // Merge: effective reader type per location, prefer a Live row in Reader-In, else Reader-Out, else Summary value
+      const inByLoc = {}; readerIn.forEach(r=>{ if(norm(r.status)==="live") inByLoc[norm(r.rcCode)||norm(r.name)] = r; });
+      const outByLoc = {}; readerOut.forEach(r=>{ if(norm(r.status)==="live") outByLoc[norm(r.rcCode)||norm(r.name)] = r; });
+      summary.forEach(r=>{
+        const key = norm(r.rcCode)||norm(r.name);
+        const upd = inByLoc[key] || outByLoc[key];
+        r.effectiveReader = upd ? upd.readerType : (r.readerIn || r.readerOut || "—");
+        r.readerUpdated = !!upd;
+      });
+
+      setState({loading:false, error:null, data:{summary,readerIn,readerOut,stock}, updatedAt:new Date()});
+    }catch(e){
+      setState(s=>({...s, loading:false, error:e.message}));
+    }
+  },[]);
+  useEffect(()=>{ load(); const t=setInterval(load, AUTO_REFRESH_MS); return ()=>clearInterval(t); },[load]);
+  return {...state, reload:load};
+}
+
+/* ---------- Tab 1: Executive Overview ---------- */
+function Overview({d, goExplore}){
+  const total = d.summary.length;
+  const live = d.summary.filter(r=>LIVE_STATUSES.includes(norm(r.status))).length;
+  const rollout = total? Math.round(live/total*100) : 0;
+  const readerReady = d.stock.reduce((a,r)=>a+(parseFloat(r.ready)||0),0);
+  const readerDeployed = d.summary.filter(r=>r.effectiveReader && r.effectiveReader!=="—").length;
+
+  const statusCounts = {};
+  d.summary.forEach(r=>{ const s=r.status||"Unknown"; statusCounts[s]=(statusCounts[s]||0)+1; });
+
+  const batchCounts = {};
+  d.summary.forEach(r=>{
+    const b=r.batch||"Unassigned";
+    batchCounts[b] = batchCounts[b] || {live:0,total:0};
+    batchCounts[b].total++;
+    if(LIVE_STATUSES.includes(norm(r.status))) batchCounts[b].live++;
+  });
+  const batchLabels = Object.keys(batchCounts).sort();
+
+  const readerTypeCounts = {};
+  d.summary.forEach(r=>{ const t=r.effectiveReader||"Unknown"; readerTypeCounts[t]=(readerTypeCounts[t]||0)+1; });
+
+  const stockByType = {};
+  d.stock.forEach(r=>{ stockByType[r.readerType||"Unknown"] = parseFloat(r.ready)||0; });
+  const needByType = {};
+  d.readerIn.forEach(r=>{ if(norm(r.status)!=="live"){ const t=r.readerType||"Unknown"; needByType[t]=(needByType[t]||0)+1; } });
+  const stockLabels = Array.from(new Set([...Object.keys(stockByType), ...Object.keys(needByType)]));
+
+  const palette = ["#E0A94D","#4FD1C5","#5B8DEF","#E07A7A","#9B8CF2","#6ADE9A"];
+
+  return (
+    <div className="space-y-6">
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+        <KpiCard label="Lokasi Live" value={live+" / "+total} sub={rollout+"% dari total lokasi"} onClick={()=>goExplore({status:"Live"})}/>
+        <KpiCard label="Progress Rollout" value={rollout+"%"} sub="Live vs total lokasi terdaftar" />
+        <KpiCard label="Reader Deployed" value={readerDeployed} sub={readerReady+" unit ready stock"} onClick={()=>goExplore({})}/>
+        <KpiCard label="Perlu Perhatian" value={(statusCounts["Pending"]||0)+(statusCounts["Rescheduled"]||0)} sub="Pending + Rescheduled" onClick={()=>goExplore({status:"Pending"})}/>
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+        <div className="card p-5 lg:col-span-2">
+          <div className="text-sm font-semibold mb-3">Rollout per Batch</div>
+          <div style={{height:260}}>
+            <Canvas deps={[JSON.stringify(batchCounts)]} build={ctx => new Chart(ctx,{
+              type:"bar",
+              data:{labels:batchLabels, datasets:[
+                {label:"Live", data:batchLabels.map(b=>batchCounts[b].live), backgroundColor:"#4FD1C5", borderRadius:4},
+                {label:"Sisa Target", data:batchLabels.map(b=>batchCounts[b].total-batchCounts[b].live), backgroundColor:"#2A3550", borderRadius:4}
+              ]},
+              options:{responsive:true,maintainAspectRatio:false,
+                scales:{x:{stacked:true,ticks:CHART_FONT,grid:{color:"#1E2A42"}},y:{stacked:true,ticks:CHART_FONT,grid:{color:"#1E2A42"}}},
+                plugins:{legend:{labels:CHART_FONT}},
+                onClick:(e,els)=>{ if(els.length) goExplore({batch:batchLabels[els[0].index]}); }
+              }
+            })}/>
+          </div>
+        </div>
+        <div className="card p-5">
+          <div className="text-sm font-semibold mb-3">Distribusi Tipe Reader</div>
+          <div style={{height:260}}>
+            <Canvas deps={[JSON.stringify(readerTypeCounts)]} build={ctx => new Chart(ctx,{
+              type:"doughnut",
+              data:{labels:Object.keys(readerTypeCounts), datasets:[{data:Object.values(readerTypeCounts), backgroundColor:palette}]},
+              options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:"bottom",labels:{...CHART_FONT,boxWidth:10,font:{size:11}}}},
+                onClick:(e,els)=>{ if(els.length) goExplore({reader:Object.keys(readerTypeCounts)[els[0].index]}); } }
+            })}/>
+          </div>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <div className="card p-5">
+          <div className="text-sm font-semibold mb-3">Stok vs Kebutuhan Implementasi</div>
+          <div style={{height:240}}>
+            <Canvas deps={[JSON.stringify(stockByType),JSON.stringify(needByType)]} build={ctx => new Chart(ctx,{
+              type:"bar",
+              data:{labels:stockLabels, datasets:[
+                {label:"Ready Stock", data:stockLabels.map(t=>stockByType[t]||0), backgroundColor:"#4FD1C5", borderRadius:4},
+                {label:"Kebutuhan (pending)", data:stockLabels.map(t=>needByType[t]||0), backgroundColor:"#E0A94D", borderRadius:4}
+              ]},
+              options:{responsive:true,maintainAspectRatio:false,indexAxis:"y",
+                scales:{x:{ticks:CHART_FONT,grid:{color:"#1E2A42"}},y:{ticks:CHART_FONT,grid:{display:false}}},
+                plugins:{legend:{labels:CHART_FONT}}}
+            })}/>
+          </div>
+        </div>
+        <div className="card p-5">
+          <div className="text-sm font-semibold mb-3">Status Lokasi</div>
+          <div className="space-y-2 mt-4">
+            {Object.entries(statusCounts).sort((a,b)=>b[1]-a[1]).map(([s,c])=>(
+              <div key={s} className="flex items-center justify-between text-sm cursor-pointer hover:opacity-80" onClick={()=>goExplore({status:s})}>
+                <Chip>{s}</Chip>
+                <span style={{color:"var(--ink-dim)"}}>{c} lokasi</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- Tab 2: Implementation Tracker ---------- */
+function Tracker({d}){
+  const Pipeline = ({title,rows,gid})=>(
+    <div className="card p-5">
+      <div className="flex items-center justify-between mb-3">
+        <div className="text-sm font-semibold">{title}</div>
+        <span className="text-xs" style={{color:"var(--ink-faint)"}}>{rows.length} baris</span>
+      </div>
+      <div className="overflow-x-auto max-h-80">
+        <table>
+          <thead><tr><th>Lokasi</th><th>Reader</th><th>Target</th><th>Status</th><th></th></tr></thead>
+          <tbody>
+            {rows.map((r,i)=>(
+              <tr key={i}>
+                <td style={{color:"var(--ink)"}}>{r.name||r.rcCode}</td>
+                <td style={{color:"var(--ink-dim)"}}>{r.readerType}</td>
+                <td style={{color:"var(--ink-dim)"}}>{r.targetDate}</td>
+                <td><Chip>{r.status}</Chip></td>
+                <td>{norm(r.status)==="live" && <span className="chip" style={{background:"#173229",color:"#6ADE9A"}}>Sync ke Summary ✓</span>}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+  return (
+    <div className="space-y-4">
+      <p className="text-sm" style={{color:"var(--ink-dim)"}}>Lokasi berstatus <b style={{color:"var(--teal)"}}>Live</b> di pipeline berikut otomatis dipakai sebagai tipe reader terbaru di tab Summary / Overview.</p>
+      <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+        <Pipeline title="Reader In — Pemasangan Baru" rows={d.readerIn} gid={GIDS.readerIn}/>
+        <Pipeline title="Reader Out — Penggantian/Pengeluaran" rows={d.readerOut} gid={GIDS.readerOut}/>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- Tab 3: Procurement & Stock ---------- */
+function Stock({d}){
+  const needByType = {};
+  d.readerIn.forEach(r=>{ if(norm(r.status)!=="live"){ const t=r.readerType||"Unknown"; needByType[t]=(needByType[t]||0)+1; } });
+  return (
+    <div className="space-y-4">
+      <div className="card overflow-x-auto">
+        <table>
+          <thead><tr><th>Tipe Reader</th><th>Ready Stock</th><th>Allocated</th><th>In Transit</th><th>Defective</th><th>Kebutuhan Pending</th><th>Status</th></tr></thead>
+          <tbody>
+            {d.stock.map((r,i)=>{
+              const ready = parseFloat(r.ready)||0;
+              const need = needByType[r.readerType]||0;
+              const low = ready < STOCK_BUFFER_MIN || ready < need;
+              return (
+                <tr key={i}>
+                  <td style={{color:"var(--ink)"}}>{r.readerType}</td>
+                  <td>{r.ready}</td><td style={{color:"var(--ink-dim)"}}>{r.allocated}</td>
+                  <td style={{color:"var(--ink-dim)"}}>{r.inTransit}</td><td style={{color:"var(--ink-dim)"}}>{r.defective}</td>
+                  <td style={{color:"var(--ink-dim)"}}>{need}</td>
+                  <td>{low ? <span className="chip" style={{background:"#3A1E1E",color:"#E07A7A"}}>⚠ Buffer Rendah</span> : <span className="chip" style={{background:"#173229",color:"#6ADE9A"}}>Aman</span>}</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+      <p className="text-xs" style={{color:"var(--ink-faint)"}}>Alert dipicu bila ready stock di bawah {STOCK_BUFFER_MIN} unit, atau di bawah jumlah kebutuhan pending dari pipeline Reader In.</p>
+    </div>
+  );
+}
+
+/* ---------- Tab 4: Raw / Source Data Explorer ---------- */
+function Explorer({d, filter, setFilter}){
+  const [tab,setTab] = useState("summary");
+  const [q,setQ] = useState("");
+  const gidOf = {summary:GIDS.summary, readerIn:GIDS.readerIn, readerOut:GIDS.readerOut, stock:GIDS.stock};
+  const rowsAll = d[tab];
+  const cols = rowsAll.length ? Object.keys(rowsAll[0]).filter(k=>k!=="_raw") : [];
+
+  const statuses = Array.from(new Set(d.summary.map(r=>r.status).filter(Boolean)));
+  const batches = Array.from(new Set(d.summary.map(r=>r.batch).filter(Boolean)));
+  const readers = Array.from(new Set(d.summary.map(r=>r.effectiveReader).filter(Boolean)));
+
+  const rows = useMemo(()=> rowsAll.filter(r=>{
+    if(q && !JSON.stringify(r).toLowerCase().includes(q.toLowerCase())) return false;
+    if(tab==="summary"){
+      if(filter.status && norm(r.status)!==norm(filter.status)) return false;
+      if(filter.batch && r.batch!==filter.batch) return false;
+      if(filter.reader && r.effectiveReader!==filter.reader) return false;
+    }
+    return true;
+  }), [rowsAll,q,filter,tab]);
+
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap gap-2">
+        {[["summary","Summary"],["readerIn","Reader In"],["readerOut","Reader Out"],["stock","Reader Stock"]].map(([k,l])=>(
+          <button key={k} className="btn" style={tab===k?{borderColor:"var(--amber)",color:"var(--amber)"}:{}} onClick={()=>setTab(k)}>{l}</button>
+        ))}
+      </div>
+      <div className="flex flex-wrap gap-2 items-center">
+        <input placeholder="Cari lokasi, kode, tipe reader…" value={q} onChange={e=>setQ(e.target.value)} style={{minWidth:220}}/>
+        {tab==="summary" && <>
+          <select value={filter.status||""} onChange={e=>setFilter(f=>({...f,status:e.target.value||undefined}))}>
+            <option value="">Semua Status</option>{statuses.map(s=><option key={s} value={s}>{s}</option>)}
+          </select>
+          <select value={filter.batch||""} onChange={e=>setFilter(f=>({...f,batch:e.target.value||undefined}))}>
+            <option value="">Semua Batch</option>{batches.map(b=><option key={b} value={b}>{b}</option>)}
+          </select>
+          <select value={filter.reader||""} onChange={e=>setFilter(f=>({...f,reader:e.target.value||undefined}))}>
+            <option value="">Semua Tipe Reader</option>{readers.map(r=><option key={r} value={r}>{r}</option>)}
+          </select>
+          {(filter.status||filter.batch||filter.reader) && <button className="btn" onClick={()=>setFilter({})}>Reset filter</button>}
+        </>}
+        <span className="text-xs ml-auto" style={{color:"var(--ink-faint)"}}>{rows.length} baris</span>
+      </div>
+      <div className="card overflow-auto" style={{maxHeight:520}}>
+        <table>
+          <thead><tr>{cols.map(c=><th key={c}>{c}</th>)}<th>Source</th></tr></thead>
+          <tbody>
+            {rows.map((r,i)=>(
+              <tr key={i}>
+                {cols.map(c=>(<td key={c} style={{color:c==="status"?undefined:"var(--ink-dim)"}}>{c==="status"?<Chip>{r[c]}</Chip>:(r[c]||"—")}</td>))}
+                <td><a href={editUrl(gidOf[tab])} target="_blank" rel="noreferrer" className="btn" style={{textDecoration:"none",fontSize:11,padding:"4px 9px"}}>Open Sheet</a></td>
+              </tr>
+            ))}
+            {!rows.length && <tr><td colSpan={cols.length+1} className="text-center py-8" style={{color:"var(--ink-faint)"}}>Tidak ada data yang cocok.</td></tr>}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- App shell ---------- */
+function App(){
+  const {loading,error,data,updatedAt,reload} = useSheetData();
+  const [tab,setTab] = useState("overview");
+  const [filter,setFilter] = useState({});
+
+  const goExplore = (f)=>{ setFilter(f); setTab("explore"); };
+
+  return (
+    <div className="min-h-screen">
+      <header className="border-b sticky top-0 z-10" style={{borderColor:"var(--border)",background:"rgba(11,18,32,.92)",backdropFilter:"blur(6px)"}}>
+        <div className="max-w-7xl mx-auto px-5 py-4 flex items-center justify-between flex-wrap gap-3">
+          <div>
+            <div className="serif text-xl">Reader Rollout — Executive Dashboard</div>
+            <div className="text-xs" style={{color:"var(--ink-faint)"}}>
+              {updatedAt ? "Update terakhir: "+updatedAt.toLocaleTimeString("id-ID") : "Memuat data…"}
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <button className="btn" onClick={reload} disabled={loading}>{loading?"Memuat…":"Refresh"}</button>
+          </div>
+        </div>
+        <nav className="max-w-7xl mx-auto px-5 flex gap-1 pb-2">
+          {[["overview","Executive Overview"],["tracker","Implementation Tracker"],["stock","Procurement & Stock"],["explore","Raw Data Explorer"]].map(([k,l])=>(
+            <button key={k} onClick={()=>setTab(k)} className="btn" style={tab===k?{background:"var(--amber)",color:"#1A1206",borderColor:"var(--amber)",fontWeight:600}:{}}>{l}</button>
+          ))}
+        </nav>
+      </header>
+
+      <main className="max-w-7xl mx-auto px-5 py-6">
+        {error && (
+          <div className="card p-5 mb-4" style={{borderColor:"#E07A7A"}}>
+            <div className="font-semibold" style={{color:"#E07A7A"}}>Gagal memuat data: {error}</div>
+            <p className="text-sm mt-1" style={{color:"var(--ink-dim)"}}>Pastikan Google Sheets sudah di-share sebagai "Anyone with the link - Viewer" dan GID di bagian CONFIG kode sudah benar. Lihat panduan setup di bawah file ini.</p>
+          </div>
+        )}
+        {!error && !data && <div style={{color:"var(--ink-dim)"}}>Memuat data dari Google Sheets…</div>}
+        {data && tab==="overview" && <Overview d={data} goExplore={goExplore}/>}
+        {data && tab==="tracker" && <Tracker d={data}/>}
+        {data && tab==="stock" && <Stock d={data}/>}
+        {data && tab==="explore" && <Explorer d={data} filter={filter} setFilter={setFilter}/>}
+      </main>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
